@@ -1,0 +1,11 @@
+build/
+releases/
+.DS_Store
+__pycache__/
+*.py[cod]
+*.o
+*.elf
+*.app/
+.env
+.env.*
+*.log
