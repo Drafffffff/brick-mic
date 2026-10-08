@@ -35,8 +35,8 @@ extension AppDelegate {
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo:content.leadingAnchor,constant:inset),stack.trailingAnchor.constraint(equalTo:content.trailingAnchor,constant:-inset),stack.topAnchor.constraint(equalTo:content.topAnchor,constant:inset),stack.bottomAnchor.constraint(equalTo:content.bottomAnchor,constant:-inset)])
     }
     func buildUI() {
-        statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.squareLength)
-        statusItem.button?.image=MicBrand.menuImage();statusItem.button?.target=self;statusItem.button?.action=#selector(statusClicked)
+        statusItem=NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
+        statusItem.button?.font=NSFont.monospacedDigitSystemFont(ofSize:12,weight:.medium);statusItem.button?.imagePosition = .imageLeading;updateStatusBar();statusItem.button?.target=self;statusItem.button?.action=#selector(statusClicked)
         statusItem.button?.sendAction(on:[.leftMouseUp,.rightMouseUp]);statusItem.button?.setAccessibilityLabel("Brick Mic")
         let menu=NSMenu()
         for (title,selector,shortcut) in [("打开 Brick Mic",#selector(show),""),("设置…",#selector(showSettings),","),("重新连接掌机",#selector(reconnect),"")] {
@@ -57,6 +57,7 @@ extension AppDelegate {
         detail.font = .monospacedDigitSystemFont(ofSize:12,weight:.regular);detail.textColor = .secondaryLabelColor
         meter.levelIndicatorStyle = .continuousCapacity;meter.minValue=0;meter.maxValue=1
         meter.warningValue=1;meter.criticalValue=1;meter.fillColor = .controlAccentColor
+        deviceStatus.font = .systemFont(ofSize:12);deviceStatus.textColor = .secondaryLabelColor
         activityRow=row([meter,detail]);activityRow.isHidden=true;meter.widthAnchor.constraint(equalToConstant:120).isActive=true
 
         transcript.isEditable=false;transcript.isSelectable=true;transcript.font = .systemFont(ofSize:19,weight:.regular)
@@ -87,13 +88,13 @@ extension AppDelegate {
         copyButton=button("复制文字",#selector(copyText));copyButton.isEnabled=false
         let flexible=NSView();flexible.setContentHuggingPriority(.defaultLow,for:.horizontal)
         let actions=row([automatic,flexible,copyButton])
-        permissionButton.title="允许自动输入…";permissionButton.target=self;permissionButton.action=#selector(permissions)
+        permissionButton.title="设置输入权限…";permissionButton.target=self;permissionButton.action=#selector(permissions)
         permissionButton.bezelStyle = .rounded;permissionButton.controlSize = .small
         permissionRow=row([label("需要辅助功能权限",size:12),permissionButton]);permissionRow.isHidden=true
         let line=divider()
-        let stack=column([header,activityRow,result,line,actions,permissionRow],spacing:16)
+        let stack=column([header,deviceStatus,activityRow,result,line,actions,permissionRow],spacing:16)
         attach(stack,to:content)
-        for v in [header,activityRow!,result,line,actions,permissionRow!] as [NSView] {fullWidth(v,in:stack)}
+        for v in [header,deviceStatus,activityRow!,result,line,actions,permissionRow!] as [NSView] {fullWidth(v,in:stack)}
         buildSettings()
         updateResult()
         if probeOut==nil {window.orderFront(nil)}
@@ -110,13 +111,14 @@ extension AppDelegate {
         let api=column([apiTitle,key,keyHint],spacing:8)
         let permissionTitle=label("输入到其他应用",size:14,color:.labelColor);permissionTitle.font = .systemFont(ofSize:14,weight:.semibold)
         permissionState.font = .systemFont(ofSize:12);permissionState.textColor = .secondaryLabelColor
-        settingsPermissionButton=button("开启权限…",#selector(permissions))
+        settingsPermissionButton=button("设置输入权限…",#selector(permissions))
         inputTestButton=button("测试输入",#selector(testInput));inputTestButton.toolTip="3 秒后输入测试文字，请先点击目标文本框"
-        let input=column([permissionTitle,permissionState,row([settingsPermissionButton,inputTestButton])],spacing:8)
+        remoteControl.target=self;remoteControl.action=#selector(toggleRemote);remoteControl.isEnabled=false;remoteControl.font = .systemFont(ofSize:12)
+        let input=column([permissionTitle,permissionState,row([settingsPermissionButton,inputTestButton]),remoteControl],spacing:8)
         advancedButton=NSButton(title:"高级设置",target:self,action:#selector(toggleAdvanced));advancedButton.isBordered=false;advancedButton.image=NSImage(systemSymbolName:"chevron.right",accessibilityDescription:nil);advancedButton.imagePosition = .imageLeading;advancedButton.setButtonType(.pushOnPushOff)
         advancedButton.setAccessibilityLabel("展开高级设置")
-        model.placeholderString="实时识别模型";endpoint.placeholderString="wss:// 服务地址"
-        model.setAccessibilityLabel("实时识别模型");endpoint.setAccessibilityLabel("服务地址")
+        model.placeholderString=ASRConfiguration.model;endpoint.placeholderString="wss:// 服务域名/api-ws/v1/inference"
+        model.setAccessibilityLabel("语音识别模型");endpoint.setAccessibilityLabel("百炼所在地域的服务地址")
         advanced=column([label("识别模型",size:11),model,label("服务地址",size:11),endpoint],spacing:6);advanced.isHidden=true
         for v in [model,endpoint] {fullWidth(v,in:advanced)}
         let flexible=NSView();flexible.setContentHuggingPriority(.defaultLow,for:.horizontal)
@@ -154,9 +156,19 @@ extension AppDelegate {
             }
         }
     }
+    func updateStatusBar() {
+        guard let button=statusItem?.button else{return}
+        let active=connected && currentSession != 0 && !broken
+        let value=MicStatusBarPresentation(connected:connected,recording:active && stopAt==nil,processing:active && stopAt != nil,percent:batteryPercent,charging:batteryCharging)
+        if value != lastStatusBarPresentation {
+            lastStatusBarPresentation=value;statusItem.length=value.itemWidth;button.image=MicStatusBarIcons.image(value);button.title=value.title
+            button.setAccessibilityLabel(value.accessibilityLabel)
+        }
+        button.toolTip=value.accessibilityLabel+(status.stringValue.isEmpty ? "":"\n"+status.stringValue)
+    }
     func setRecording(_ active:Bool) {
         let recording=active && stopAt==nil
-        activityRow.isHidden = !recording;statusItem.button?.image=MicBrand.menuImage(recording:recording)
+        activityRow.isHidden = !recording;updateStatusBar()
         connectionDot.color=recording ? .systemRed:(active ? .controlAccentColor:(connected ? .systemGreen:.tertiaryLabelColor))
         updateResult();updateWindowMinimum()
     }

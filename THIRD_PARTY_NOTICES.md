@@ -13,6 +13,7 @@ Brick Mic code is distributed under GPL-3.0, as in the original [next-ui-AItrans
 | Rust standard library | rustc 1.98.0-nightly, `4c9d2bfe4` | MIT / Apache-2.0, `licenses/RUST-LICENSE-*.txt` |
 | Rust dependencies | Locked by pinned PocketJS Cargo.lock | Individual notices in `licenses/rust/` |
 | SDL2 / SDL2_ttf | Dynamically linked to NextUI's existing libraries | zlib, `licenses/SDL2-LICENSE.txt`, `licenses/SDL2-TTF-LICENSE.txt` |
+| Lucide menu icons | https://github.com/lucide-icons/lucide | ISC, `mac/assets/lucide/LICENSE.txt` |
 | Chinese fonts | See `fonts/README.md` | SIL OFL 1.1; notices in `fonts/` and Brick package |
 
 The tg5040 Docker build environment is pinned by image digest in `scripts/pins.env`. Dependency acquisition and checks are part of the build scripts; upstream source is not copied into this repository. License texts from the pinned runtime dependencies accompany the compiled Brick package. Font software retains its own OFL license rather than the code's GPL license.

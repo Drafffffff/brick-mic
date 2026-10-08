@@ -4,17 +4,34 @@ TASK_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 APP_VERSION=$(cat "$TASK_ROOT/VERSION")
 MAC_ARCH=$(uname -m)
 MAC_SDK=$(xcrun --sdk macosx --show-sdk-path)
+INSTALL_AFTER_BUILD=false
+case "${1:-}" in
+  "") ;;
+  --install) INSTALL_AFTER_BUILD=true; shift ;;
+  *) printf 'Usage: %s [--install]\n' "$0" >&2; exit 2 ;;
+esac
+if [ "$#" -ne 0 ]; then printf 'Usage: %s [--install]\n' "$0" >&2; exit 2; fi
+SIGNING_HELPER="$TASK_ROOT/scripts/mac-signing.py"
+# Resolve the already-pinned public identity before compiling or changing any
+# bundle. A missing/unavailable identity must never fall back to adhoc signing.
+SIGNING_IDENTITY=$(python3 "$SIGNING_HELPER" identity)
 OUTPUT="$TASK_ROOT/build/brick-mic"
 APP="$OUTPUT/Brick Mic.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+rm -rf "$APP/Contents/Resources/lucide"
+cp -R "$TASK_ROOT/mac/assets/lucide" "$APP/Contents/Resources/"
 swiftc -swift-version 5 -framework AppKit "$TASK_ROOT/mac/Brand.swift" "$TASK_ROOT/mac/render-icon.swift" -o "$OUTPUT/render-icon"
 "$OUTPUT/render-icon" "$OUTPUT/BrickMic.iconset"
 iconutil -c icns "$OUTPUT/BrickMic.iconset" -o "$APP/Contents/Resources/BrickMic.icns"
 swiftc -swift-version 5 -O -target "$MAC_ARCH-apple-macosx13.0" -sdk "$MAC_SDK" -framework AppKit -framework CoreBluetooth -framework ApplicationServices \
   "$TASK_ROOT/mac/Credentials.swift" \
   "$TASK_ROOT/mac/Codec.swift" "$TASK_ROOT/mac/ASR.swift" \
-  "$TASK_ROOT/mac/Bluetooth.swift" "$TASK_ROOT/mac/Brand.swift" \
-  "$TASK_ROOT/mac/Interface.swift" "$TASK_ROOT/mac/main.swift" \
+  "$TASK_ROOT/mac/ShortClipGate.swift" \
+  "$TASK_ROOT/mac/SingleInstance.swift" \
+  "$TASK_ROOT/mac/NotificationDelivery.swift" \
+  "$TASK_ROOT/mac/DesktopTaskMetadata.swift" \
+  "$TASK_ROOT/mac/Control.swift" "$TASK_ROOT/mac/Bluetooth.swift" "$TASK_ROOT/mac/Brand.swift" \
+  "$TASK_ROOT/mac/Permissions.swift" "$TASK_ROOT/mac/StatusBar.swift" "$TASK_ROOT/mac/Interface.swift" "$TASK_ROOT/mac/main.swift" \
   -o "$APP/Contents/MacOS/BrickMic"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>Brick Mic</string>
 <key>CFBundleIconFile</key><string>BrickMic</string>
 <key>CFBundleExecutable</key><string>BrickMic</string>
-<key>CFBundleVersion</key><string>2</string>
+<key>CFBundleVersion</key><string>20</string>
 <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>
@@ -33,5 +50,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 PLIST
-codesign --force --sign - --identifier com.nextui.brickmic "$APP"
+codesign --force --sign "$SIGNING_IDENTITY" --identifier com.nextui.brickmic "$APP"
+python3 "$SIGNING_HELPER" verify "$APP"
 printf 'Built: %s\n' "$APP"
+if [ "$INSTALL_AFTER_BUILD" = true ]; then
+  "$TASK_ROOT/scripts/install-mac.sh"
+fi

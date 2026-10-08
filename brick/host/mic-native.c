@@ -1,3 +1,5 @@
+//go:build ignore
+
 #define _GNU_SOURCE
 #include "mic-native.h"
 #include "mic-power.h"
@@ -28,16 +30,39 @@ static pthread_cond_t wake=PTHREAD_COND_INITIALIZER;
 static pthread_t worker;
 static int worker_started,stopping,presented,preview;
 static int paused,pause_requested,restart_requested;
+static int deep_requested,deep_paused,connection=-1;
+static double connection_at;
 static unsigned wake_generation;
 static pid_t backend_pid;
 static char socket_path[104],runtime_dir[64],font_path[1024];
-static char snapshot[22000]="{\"state\":\"bluetooth\",\"connected\":false}";
+static char snapshot[65536]="{\"state\":\"bluetooth\",\"connected\":false}";
 static char command_error[256];
-static char commands[8][12];
+static char commands[32][96];
 static unsigned head,tail;
 static uint32_t palette[8]={0,0xffffffff,0x9b2257ff,0x1e2329ff,0xffffffff,0x000000ff,0xffffffff,0x000000ff};
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
-static void publish(const char *value){pthread_mutex_lock(&mutex);snprintf(snapshot,sizeof(snapshot),"%s",value);pthread_mutex_unlock(&mutex);}
+static int read_connection(const char *value){
+    /* Only accept the top-level boolean; nested task data must not affect sleep. */
+    int depth=0;
+    for(const char *p=value;*p;p++){
+        if(*p=='{'||*p=='[')depth++;
+        else if(*p=='}'||*p==']')depth--;
+        else if(*p=='"'){
+            const char *key=p++;while(*p&&*p!='"'){if(*p=='\\'&&p[1])p++;p++;}
+            if(!*p)break;
+            if(depth==1&&p-key==10&&!strncmp(key,"\"connected\"",11)){
+                const char *v=p+1;while(*v==' '||*v=='\t'||*v=='\r'||*v=='\n')v++;
+                if(*v++!=':')continue;
+                while(*v==' '||*v=='\t'||*v=='\r'||*v=='\n')v++;
+                if(!strncmp(v,"true",4)&&(v[4]==','||v[4]=='}'||v[4]==' '||v[4]=='\n'||v[4]=='\r'||v[4]=='\t'))return 1;
+                if(!strncmp(v,"false",5)&&(v[5]==','||v[5]=='}'||v[5]==' '||v[5]=='\n'||v[5]=='\r'||v[5]=='\t'))return 0;
+                return -1;
+            }
+        }
+    }
+    return -1;
+}
+static void publish(const char *value){pthread_mutex_lock(&mutex);snprintf(snapshot,sizeof(snapshot),"%s",value);connection=read_connection(value);connection_at=now();pthread_mutex_unlock(&mutex);}
 static void theme(void){
     const char *settings=getenv("BRICK_MIC_SETTINGS"),*res=getenv("RES_PATH"),*fallback=getenv("BRICK_MIC_FONT");
     if(!settings)settings="/mnt/SDCARD/.userdata/shared/minuisettings.txt";
@@ -66,7 +91,7 @@ static int rpc(const char *command,char *out,size_t size){
     struct timeval timeout={0,200000};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));setsockopt(fd,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
     struct sockaddr_un addr={0};addr.sun_family=AF_UNIX;snprintf(addr.sun_path,sizeof(addr.sun_path),"%s",socket_path);
     if(connect(fd,(struct sockaddr*)&addr,sizeof(addr))<0){close(fd);return 0;}
-    char line[32];int length=snprintf(line,sizeof(line),"%s\n",command);
+    char line[100];int length=snprintf(line,sizeof(line),"%s\n",command);
     if(send(fd,line,(size_t)length,0)!=length){close(fd);return 0;}
     size_t used=0;int complete=0;
     while(used+1<size){ssize_t n=recv(fd,out+used,size-used-1,0);if(n<=0)break;used+=(size_t)n;if(memchr(out,'\n',used)){complete=1;break;}}
@@ -95,8 +120,10 @@ static void restore_link_preferences(void){
 }
 static void backend_stop(void){
     if(backend_pid<=0)return;
-    rpc("cancel",(char[22000]){0},22000);
-    kill(-backend_pid,SIGTERM);double until=now()+0.4;
+    rpc("cancel",(char[65536]){0},65536);
+    /* Allow the daemon to unregister advertising and release its own peer.
+       Killing after 400ms could leave a live BLE link across app reentry. */
+    kill(-backend_pid,SIGTERM);double until=now()+5.0;
     while(now()<until){if(waitpid(backend_pid,NULL,WNOHANG)==backend_pid)break;struct timespec pause={0,10000000};nanosleep(&pause,NULL);}
     kill(-backend_pid,SIGKILL);waitpid(backend_pid,NULL,0);backend_pid=0;
     restore_link_preferences();
@@ -109,25 +136,43 @@ static void *run(void *unused){
     pthread_mutex_unlock(&mutex);
     if(stop)return NULL;
     int failed=!backend_start(0),was_ready=0,resumed=0,retries=0,misses=0;
-    double started=now(),retry_at=now()+1;
-    if(failed)publish("{\"state\":\"error\",\"error\":\"蓝牙启动失败，正在重试；也可按 A 重试\"}");
+    double started=now(),retry_at=now()+1,status_at=0;
+    if(failed)publish("{\"state\":\"error\",\"error\":\"蓝牙启动失败，正在重试\"}");
     for(;;){
-        char command[12]="",out[22000];
+        char command[96]="",out[65536];
         pthread_mutex_lock(&mutex);
         int sleep=pause_requested,restart=restart_requested;restart_requested=0;
         if(sleep&&!paused){
             head=tail;
             pthread_mutex_unlock(&mutex);
-            rpc("cancel",out,sizeof(out));
+            rpc("sleep",out,sizeof(out));
             pthread_mutex_lock(&mutex);
             paused=1;pthread_cond_broadcast(&wake);
         }
-        while(paused&&pause_requested&&!stopping)pthread_cond_wait(&wake,&mutex);
-        paused=0;stop=stopping;
-        if(head!=tail){snprintf(command,sizeof(command),"%s",commands[head%8]);head++;}
+        while(paused&&pause_requested&&!stopping){
+            /* Keep the backend and BLE alive. A small local status read once a
+             * second keeps the idle-disconnect timer honest without rendering. */
+            if(deep_requested){
+                deep_paused=1;pthread_cond_broadcast(&wake);
+                while(deep_requested&&pause_requested&&!stopping)pthread_cond_wait(&wake,&mutex);
+                deep_paused=0;pthread_cond_broadcast(&wake);
+                continue;
+            }
+            struct timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_sec++;
+            int rc=pthread_cond_timedwait(&wake,&mutex,&until);
+            if(rc==ETIMEDOUT&&pause_requested&&!deep_requested&&!stopping){
+                pthread_mutex_unlock(&mutex);
+                if(rpc("status",out,sizeof(out))&&out[0]=='{')publish(out);
+                else{pthread_mutex_lock(&mutex);connection=-1;connection_at=now();pthread_mutex_unlock(&mutex);}
+                pthread_mutex_lock(&mutex);
+            }
+        }
+        int waking=paused;paused=0;stop=stopping;
+        if(head!=tail){snprintf(command,sizeof(command),"%s",commands[head%32]);head++;}
         restart|=restart_requested;restart_requested=0;
         pthread_mutex_unlock(&mutex);
         if(stop)break;
+        if(waking)rpc("wake",out,sizeof(out));
         if(restart||(failed&&retries<3&&now()>=retry_at)){
             if(restart){resumed=restart!=2;retries=0;}
             else retries++;
@@ -138,11 +183,11 @@ static void *run(void *unused){
             printf("microphone_backend_restart resumed=%d attempt=%d\n",resumed,retries);
             failed=!backend_start(resumed);
             retry_at=now()+1+retries;
-            if(failed)publish("{\"state\":\"error\",\"error\":\"蓝牙服务无法启动，按 A 重试\"}");
+            if(failed)publish("{\"state\":\"error\",\"error\":\"蓝牙服务无法启动\"}");
         }
         if(!failed&&backend_pid>0&&waitpid(backend_pid,NULL,WNOHANG)==backend_pid){
             backend_stop();failed=1;retry_at=now()+1+retries;
-            publish("{\"state\":\"error\",\"error\":\"蓝牙服务启动失败，正在重试；也可按 A 重试\"}");
+            publish("{\"state\":\"error\",\"error\":\"蓝牙服务启动失败，正在重试\"}");
         }
         if(!failed){
             if(*command){
@@ -152,12 +197,13 @@ static void *run(void *unused){
                 else if(out[0]!='{'){out[strcspn(out,"\r\n")]=0;snprintf(command_error,sizeof(command_error),"%.250s",out);}
                 pthread_mutex_unlock(&mutex);
             }
+            if(now()<status_at){struct timespec pause={0,20000000};nanosleep(&pause,NULL);continue;}status_at=now()+0.1;
             if(rpc("ping",out,sizeof(out))&&!strncmp(out,"ready\n",6)){
                 was_ready=1;misses=0;retries=0;
                 if(rpc("status",out,sizeof(out))&&out[0]=='{')publish(out);
             }else if((was_ready&&++misses>=5)||(!was_ready&&now()-started>20)){
                 backend_stop();failed=1;retry_at=now()+1+retries;
-                publish("{\"state\":\"error\",\"error\":\"语音服务连接中断，正在重试；也可按 A 重试\"}");
+                publish("{\"state\":\"error\",\"error\":\"语音服务连接中断，正在重试\"}");
             }else if(!was_ready){
                 char path[140],stage[24]="bluetooth";
                 snprintf(path,sizeof(path),"%s/stage",runtime_dir);
@@ -166,8 +212,8 @@ static void *run(void *unused){
                 publish(!strncmp(stage,"service",7)?"{\"state\":\"service\",\"connected\":false}":"{\"state\":\"bluetooth\",\"connected\":false}");
             }
         }
-        if(failed&&retries>=3)publish("{\"state\":\"error\",\"error\":\"蓝牙服务未能恢复，按 A 重试或 MENU 返回\"}");
-        struct timespec pause={0,80000000};nanosleep(&pause,NULL);
+        if(failed&&retries>=3)publish("{\"state\":\"error\",\"error\":\"蓝牙服务未能恢复\"}");
+        struct timespec pause={0,20000000};nanosleep(&pause,NULL);
     }
     backend_stop();
     return NULL;
@@ -175,7 +221,7 @@ static void *run(void *unused){
 void brick_mic_first_present(void){pthread_mutex_lock(&mutex);presented=1;pthread_cond_broadcast(&wake);pthread_mutex_unlock(&mutex);}
 void brick_mic_sleep(int asleep,int restart){
     pthread_mutex_lock(&mutex);pause_requested=asleep;
-    if(!asleep){wake_generation++;restart_requested=restart;command_error[0]=0;}
+    if(!asleep){deep_requested=0;wake_generation++;restart_requested=restart;command_error[0]=0;}
     pthread_cond_broadcast(&wake);
     if(asleep&&worker_started){
         struct timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_nsec+=400000000;
@@ -184,8 +230,31 @@ void brick_mic_sleep(int asleep,int restart){
     }
     pthread_mutex_unlock(&mutex);
 }
+int brick_mic_connection(void){
+    pthread_mutex_lock(&mutex);int value=now()-connection_at<=3?connection:-1;pthread_mutex_unlock(&mutex);return value;
+}
+void brick_mic_abort_deep_sleep(void){
+    char out[65536];rpc("abort-deep-sleep",out,sizeof(out));
+    pthread_mutex_lock(&mutex);deep_requested=0;pthread_cond_broadcast(&wake);pthread_mutex_unlock(&mutex);
+}
+int brick_mic_prepare_deep_sleep(void){
+    pthread_mutex_lock(&mutex);
+    if(!pause_requested||!paused||stopping||!worker_started||connection!=0||now()-connection_at>3){pthread_mutex_unlock(&mutex);return 0;}
+    deep_requested=1;pthread_cond_broadcast(&wake);
+    struct timespec until;clock_gettime(CLOCK_REALTIME,&until);until.tv_nsec+=400000000;
+    if(until.tv_nsec>=1000000000){until.tv_sec++;until.tv_nsec-=1000000000;}
+    while(!deep_paused&&pause_requested&&!stopping)if(pthread_cond_timedwait(&wake,&mutex,&until)==ETIMEDOUT)break;
+    int ok=deep_paused&&pause_requested&&!stopping;
+    pthread_mutex_unlock(&mutex);
+    char out[65536];
+    /* The daemon reserves the disconnected session under its state lock. It
+     * rejects a new hello until wake/abort, closing the final reconnect race. */
+    ok=ok&&rpc("prepare-deep-sleep",out,sizeof(out))&&!strcmp(out,"asleep-ready\n");
+    if(!ok)brick_mic_abort_deep_sleep();
+    return ok;
+}
 static JSValue get_state(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
-    (void)self;(void)argc;(void)argv;char copy[22000],error[256];
+    (void)self;(void)argc;(void)argv;char copy[65536],error[256];
     pthread_mutex_lock(&mutex);snprintf(copy,sizeof(copy),"%s",snapshot);snprintf(error,sizeof(error),"%s",command_error);pthread_mutex_unlock(&mutex);
     JSValue state=JS_ParseJSON(ctx,copy,strlen(copy),"mic-state");
     if(!JS_IsException(state)){
@@ -200,8 +269,18 @@ static JSValue get_state(JSContext *ctx,JSValueConst self,int argc,JSValueConst 
 static JSValue send_command(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
     (void)self;if(!argc)return JS_FALSE;const char *command=JS_ToCString(ctx,argv[0]);if(!command)return JS_EXCEPTION;
     int retry=!strcmp(command,"retry");
-    int valid=retry||!strcmp(command,"start")||!strcmp(command,"stop")||!strcmp(command,"cancel");
-    pthread_mutex_lock(&mutex);if(retry){if(restart_requested!=1)restart_requested=2;pthread_cond_broadcast(&wake);}else if(valid&&tail-head<8){snprintf(commands[tail%8],12,"%s",command);tail++;}else valid=0;pthread_mutex_unlock(&mutex);
+    int valid=strlen(command)<96&&(retry||!strcmp(command,"start")||!strcmp(command,"stop")||!strcmp(command,"cancel")||(!strncmp(command,"control:",8)||!strncmp(command,"hosts:",6)));
+    pthread_mutex_lock(&mutex);
+    if(retry){if(restart_requested!=1)restart_requested=2;pthread_cond_broadcast(&wake);}
+    else if(valid&&!strcmp(command,"cancel")){head=tail;snprintf(commands[tail%32],96,"%s",command);tail++;}
+    else if(valid&&!strcmp(command,"stop")){
+        /* Drop queued cursor repeats, but keep a quick tap's pending start. */
+        char pending[32][96];unsigned n=0;
+        while(head!=tail){const char *item=commands[head%32];if(strncmp(item,"control:",8)&&n<31)snprintf(pending[n++],96,"%s",item);head++;}
+        head=tail=0;for(unsigned i=0;i<n;i++)snprintf(commands[tail++%32],96,"%s",pending[i]);
+        snprintf(commands[tail++%32],96,"stop");
+    }else if(valid&&tail-head<31){snprintf(commands[tail%32],96,"%s",command);tail++;}else valid=0;
+    pthread_mutex_unlock(&mutex);
     JS_FreeCString(ctx,command);return JS_NewBool(ctx,valid);
 }
 static JSValue get_theme(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
@@ -253,7 +332,7 @@ static JSValue load_fonts(JSContext *ctx,JSValueConst self,int argc,JSValueConst
     int ok=atlas(points,count,30,21)&&atlas(points,count,40,22)&&atlas(points,count,54,23);return JS_NewBool(ctx,ok);
 }
 static int32_t boot(JSContext *ctx,const uint8_t *pak,size_t size,int32_t w,int32_t h){
-    stopping=presented=paused=pause_requested=restart_requested=0;wake_generation=0;head=tail=0;command_error[0]=0;backend_pid=0;
+    stopping=presented=paused=pause_requested=restart_requested=0;deep_requested=deep_paused=0;connection=-1;connection_at=0;wake_generation=0;head=tail=0;command_error[0]=0;backend_pid=0;
     snprintf(snapshot,sizeof(snapshot),"{\"state\":\"bluetooth\",\"connected\":false}");
     theme();setenv("POCKETJS_FONT",font_path,1);setenv("POCKETJS_HARDWARE","0",1);
     if(!brick_services_boot(ctx,pak,size,w,h))return 0;

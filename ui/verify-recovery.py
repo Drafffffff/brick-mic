@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix='mic-recovery-check-') as folder:
     mock=Mock(data/'mic.sock')
     env={**os.environ,'BRICK_MIC_PREVIEW':'1','BRICK_MIC_SOCKET':str(data/'mic.sock'),
          'POCKETJS_DATA':str(data/'cache'),'BRICK_MIC_FONT':str(ROOT/'fonts/font1.ttf'),
-         'BRICK_MIC_SETTINGS':str(ROOT/'ui/theme-preview.txt')}
+         'BRICK_MIC_SETTINGS':str(ROOT/'build/brick-mic/theme-preview.txt')}
     process=subprocess.Popen([str(PACKAGE/'pocketjs-mic'),'--headless','--frames','250'],
                              cwd=PACKAGE,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     try:

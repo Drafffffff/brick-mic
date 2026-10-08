@@ -20,7 +20,9 @@ xcode-select --install
 
 产物：`build/brick-mic/Brick Mic.app`。编译为当前 Mac 的架构：Apple Silicon 上为 arm64，Intel 上为 x86_64；当前 Release 仅提供已经验证的 arm64 包。
 
-脚本用 Swift 编译 AppKit 程序，并生成图标、Info.plist 和本地签名。不需要 Go、Docker、PocketJS、百炼 Key 或 Rust。开发预览可跳过蓝牙与云端：
+构建要求本机已配置固定代码签名身份。先在钥匙串中选择自己的既有代码签名证书，确认信任后手动执行 `python3 scripts/mac-signing.py init --identity "证书名称"`；后续始终复用它，脚本不会自动创建证书或退回 adhoc。当前维护者固定身份见 AGENTS.md。
+
+脚本用 Swift 编译 AppKit 程序，并生成图标、Info.plist 和固定签名。不需要 Go、Docker、PocketJS、百炼 Key 或 Rust。开发预览可跳过蓝牙与云端：
 
 ```sh
 "build/brick-mic/Brick Mic.app/Contents/MacOS/BrickMic" --ui-preview=result --dark
@@ -28,7 +30,7 @@ xcode-select --install
 
 预览状态：`ready`、`waiting`、`recording`、`processing`、`result`、`permission`、`settings`；`--long-text` 检查长文字，`--missing-permission` 模拟权限提示。省略 `--dark` 使用浅色。
 
-正式使用请先退出旧应用，再将产物拷到 `/Applications/Brick Mic.app`。本地重新编译会改变签名，macOS 可能要求重新确认蓝牙和辅助功能权限；若旧条目失效，移除后重新添加这个正式安装路径。
+正式更新运行 `./scripts/build-mac.sh --install`，自动备份、校验固定签名、替换并打开 `/Applications/Brick Mic.app`。保留 Key 和设置。授权后仍提示未生效时，先退出并重开正式版；系统授权由用户手动完成，不改 TCC。预览也遵守单实例，先退出正式版，结束后重开安装版。
 
 ## 编译掌机包
 
@@ -93,6 +95,8 @@ Linux 或 Intel Mac 请使用 `scripts/prepare.sh` 下载的对应 Bun 路径。
 ./scripts/package-release.sh
 ```
 
-`releases/v0.2.0/` 包含 Mac ZIP、Brick ZIP、SHA256SUMS.txt 和构建说明。ZIP 保留应用文件夹名称与执行权限；Mac 包包含 arm64 接收端，Brick 包包含完整 PocketJS 字库与依赖许可证。
+`releases/v0.4.16/` 包含 Mac ZIP、Brick ZIP、Linux 源码安装包、SHA256SUMS.txt 和构建说明。ZIP 保留应用文件夹名称与执行权限；Mac 包包含 arm64 接收端，Brick 包包含完整 PocketJS 字库与依赖许可证。
 
 发布二进制前，请保留同版本源代码、固定依赖记录和第三方许可证；Release 不应包含 API Key、录音、个人配置、诊断输出或设备数据目录。
+
+可选 Codex 功能见 [hooks 配置](../codex-hooks/README.md)。Linux 依赖和安装见 [Linux 教程](LINUX.md)。Mac 固定签名、短录音、任务输入及通知的离线边界测试位于 `mac/tests/`。

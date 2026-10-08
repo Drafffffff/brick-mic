@@ -1,22 +1,25 @@
 import AppKit
 
-// One vector mark, drawn at the destination resolution for crisp menu bar and app icons.
+// App icon drawn at its destination resolution. Menu bar states live in StatusBar.swift.
 enum MicBrand {
-    static func menuImage(recording:Bool=false)->NSImage {
-        let image=NSImage(size:NSSize(width:19,height:19),flipped:false){rect in
-            NSColor.labelColor.setStroke()
-            let body=NSBezierPath(roundedRect:NSRect(x:4,y:1,width:11,height:17),xRadius:2.5,yRadius:2.5)
-            body.lineWidth=1.4;body.stroke()
-            let capsule=NSBezierPath(roundedRect:NSRect(x:8,y:9,width:3,height:6),xRadius:1.5,yRadius:1.5)
-            if recording {NSColor.labelColor.setFill();capsule.fill()} else {capsule.lineWidth=1.2;capsule.stroke()}
-            let mic=NSBezierPath();mic.move(to:NSPoint(x:6.5,y:11));mic.line(to:NSPoint(x:6.5,y:9.5))
-            mic.curve(to:NSPoint(x:12.5,y:9.5),controlPoint1:NSPoint(x:6.5,y:6),controlPoint2:NSPoint(x:12.5,y:6))
-            mic.line(to:NSPoint(x:12.5,y:11));mic.lineWidth=1.2;mic.stroke()
-            let stem=NSBezierPath();stem.move(to:NSPoint(x:9.5,y:7));stem.line(to:NSPoint(x:9.5,y:5));stem.lineWidth=1.2;stem.stroke()
-            NSColor.labelColor.setFill();NSBezierPath(ovalIn:NSRect(x:8.5,y:2.5,width:2,height:1)).fill()
-            return true
-        }
-        image.isTemplate=true;image.accessibilityDescription="Brick Mic";return image
+    // The menu bar keeps the app's Brick + microphone silhouette in every state.
+    static func drawMenuMark(in rect:NSRect) {
+        NSGraphicsContext.saveGraphicsState();defer{NSGraphicsContext.restoreGraphicsState()}
+        let transform=NSAffineTransform();transform.translateX(by:rect.minX,yBy:rect.minY)
+        transform.scaleX(by:rect.width/18,yBy:rect.height/18);transform.concat()
+        NSColor.black.setStroke();NSColor.black.setFill()
+        let body=NSBezierPath(roundedRect:NSRect(x:2,y:0.75,width:11.5,height:16.5),xRadius:2.2,yRadius:2.2)
+        body.lineWidth=1.35;body.stroke()
+        let screen=NSBezierPath(roundedRect:NSRect(x:3.8,y:7.5,width:7.9,height:8.1),xRadius:1,yRadius:1)
+        screen.lineWidth=0.8;screen.stroke()
+        NSBezierPath(roundedRect:NSRect(x:6.85,y:11.4,width:1.8,height:2.6),xRadius:0.9,yRadius:0.9).fill()
+        let mic=NSBezierPath();mic.move(to:NSPoint(x:5.6,y:11.3));mic.line(to:NSPoint(x:5.6,y:10.7))
+        mic.curve(to:NSPoint(x:9.9,y:10.7),controlPoint1:NSPoint(x:5.6,y:8.7),controlPoint2:NSPoint(x:9.9,y:8.7));mic.line(to:NSPoint(x:9.9,y:11.3))
+        mic.move(to:NSPoint(x:7.75,y:9.25));mic.line(to:NSPoint(x:7.75,y:8.5));mic.lineWidth=1;mic.lineCapStyle = .round;mic.stroke()
+        NSBezierPath(roundedRect:NSRect(x:4,y:4,width:3.4,height:1),xRadius:0.2,yRadius:0.2).fill()
+        NSBezierPath(roundedRect:NSRect(x:5.2,y:2.8,width:1,height:3.4),xRadius:0.2,yRadius:0.2).fill()
+        NSBezierPath(ovalIn:NSRect(x:9.05,y:3.1,width:1.35,height:1.35)).fill()
+        NSBezierPath(ovalIn:NSRect(x:10.9,y:4.75,width:1.35,height:1.35)).fill()
     }
     static func drawIcon(in rect:NSRect) {
         NSGraphicsContext.saveGraphicsState();defer{NSGraphicsContext.restoreGraphicsState()}

@@ -46,43 +46,91 @@ type Advertisement struct{}
 func (*Advertisement) Release() *dbus.Error { return nil }
 
 type State struct {
-	State     string  `json:"state"`
-	Connected bool    `json:"connected"`
-	Session   uint16  `json:"session"`
-	RMS       int     `json:"rms"`
-	Frames    uint32  `json:"frames"`
-	Seconds   float64 `json:"seconds"`
-	Text      string  `json:"text"`
-	Error     string  `json:"error"`
-	Packet    int     `json:"packet"`
+	Hosts     Hosts        `json:"hosts"`
+	State     string       `json:"state"`
+	Connected bool         `json:"connected"`
+	Session   uint16       `json:"session"`
+	RMS       int          `json:"rms"`
+	Frames    uint32       `json:"frames"`
+	Seconds   float64      `json:"seconds"`
+	Text      string       `json:"text"`
+	Error     string       `json:"error"`
+	Packet    int          `json:"packet"`
+	Control   ControlState `json:"control"`
+	Battery   Battery      `json:"battery"`
 }
 type Mic struct {
-	mu           sync.Mutex
-	wire         sync.Mutex
-	conn         *dbus.Conn
-	props        *prop.Properties
-	state        State
-	notify       bool
-	receiver     string
-	cancel       context.CancelFunc
-	done         chan struct{}
-	probeFile    string
-	probeSecs    int
-	probeOnce    sync.Once
-	stoppedAt    time.Time
-	serviceReady bool
-	acks         bool
-	ackFrames    uint32
+	discoveryUntil    time.Time
+	lastHostLog       string
+	lastHostLogAt     time.Time
+	mu                sync.Mutex
+	wire              sync.Mutex
+	conn              *dbus.Conn
+	props             *prop.Properties
+	state             State
+	notify            bool
+	receiver          string
+	cancel            context.CancelFunc
+	done              chan struct{}
+	probeFile         string
+	probeSecs         int
+	probeOnce         sync.Once
+	stoppedAt         time.Time
+	serviceReady      bool
+	gattRegistered    bool
+	advertRegistered  bool
+	legacyConfigured  bool
+	acks              bool
+	ackFrames         uint32
+	controls          bool
+	remote            bool
+	token             string
+	assembly          controlAssembler
+	events            map[string]bool
+	eventOrder        []string
+	alerts            chan string
+	notifyAcks        chan notificationReceipt
+	screenAsleep      bool
+	deepReserved      bool
+	disconnectedSince time.Time
+	telemetryKick     chan struct{}
+	alertCancel       context.CancelFunc
 }
 
-// Kept only in the private /tmp runtime, to release this app's stale peer after
-// a process crash. No recording, transcript, or credentials are written here.
+// Retain only this app's peer across launches until reboot. Each UI launch has
+// a different runtime directory, so a runtime-only record cannot recover reentry.
 func receiverFile() string {
 	runtime := os.Getenv("BRICK_MIC_RUNTIME")
 	if !strings.HasPrefix(runtime, "/tmp/brick-mic-") {
 		return ""
 	}
+	if os.Getenv("BRICK_MIC_RECEIVER_RECORD") == "/tmp/brick-mic-receiver" {
+		return "/tmp/brick-mic-receiver"
+	}
 	return runtime + "/receiver"
+}
+
+func rememberReceiver(path string) error {
+	file := receiverFile()
+	if file == "" || !validReceiver(path) {
+		return nil
+	}
+	// Atomic replacement avoids following an existing symlink or leaving a
+	// truncated record when the process is interrupted.
+	tmp, err := os.CreateTemp("/tmp", "brick-mic-peer-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	_, err = tmp.WriteString(path)
+	closeErr := tmp.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp.Name(), file)
 }
 func validReceiver(path string) bool {
 	const prefix = "/org/bluez/hci0/dev_"
@@ -97,6 +145,10 @@ func resetPreviousReceiver(conn *dbus.Conn) error {
 	if file == "" {
 		return nil
 	}
+	info, err := os.Lstat(file)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 128 {
+		return nil
+	}
 	bytes, err := os.ReadFile(file)
 	if err != nil || len(bytes) > 128 {
 		return nil
@@ -104,6 +156,13 @@ func resetPreviousReceiver(conn *dbus.Conn) error {
 	path := strings.TrimSpace(string(bytes))
 	if !validReceiver(path) {
 		return nil
+	}
+	// Linux 4.9 can restart the old advertisement immediately on disconnect.
+	// Disable the app's compatibility advertisement before releasing its peer.
+	if tinaLegacyKernel() {
+		if err := legacyAdvertisingCommand("0x000a", []byte{0}); err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -123,14 +182,23 @@ func resetPreviousReceiver(conn *dbus.Conn) error {
 	return nil
 }
 
-func (m *Mic) snapshot() State { m.mu.Lock(); defer m.mu.Unlock(); return m.state }
+func (m *Mic) snapshot() State {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state.Hosts.Discovering && time.Now().After(m.discoveryUntil) {
+		m.state.Hosts.Discovering = false
+	}
+	s := m.state
+	s.Hosts.Known = append([]Host(nil), m.state.Hosts.Known...)
+	return s
+}
 func (m *Mic) start(probe bool) error {
 	m.mu.Lock()
 	if !m.state.Connected || !m.notify {
 		m.mu.Unlock()
 		return errors.New("请先连接 Mac 上的 Brick Mic")
 	}
-	if m.state.State == "recording" || m.state.State == "processing" {
+	if m.state.State == "service" || m.state.State == "recording" || m.state.State == "processing" {
 		m.mu.Unlock()
 		return errors.New("上一轮还未结束")
 	}
@@ -141,6 +209,10 @@ func (m *Mic) start(probe bool) error {
 			m.mu.Unlock()
 			return errors.New("上一轮正在关闭，请稍后重试")
 		}
+	}
+	if m.alertCancel != nil {
+		m.alertCancel()
+		m.alertCancel = nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
@@ -173,6 +245,7 @@ func (m *Mic) stop(cancelled bool) {
 	if cancelled {
 		m.state.State = "ready"
 		m.state.Text = ""
+		m.state.Error = ""
 	}
 	m.mu.Unlock()
 	if cancel != nil {
@@ -316,13 +389,17 @@ func (m *Mic) capture(ctx context.Context, done chan struct{}, sid uint16, probe
 		}
 	}
 	m.mu.Lock()
-	cancelled := m.state.State == "ready" || !m.state.Connected
+	cancelled := m.state.State == "ready" || m.state.State == "error" || !m.state.Connected
 	if !cancelled {
 		m.state.State = "processing"
 	}
 	m.state.RMS = 0
 	m.cancel = nil
 	m.mu.Unlock()
+	select {
+	case m.telemetryKick <- struct{}{}:
+	default:
+	}
 	if !cancelled {
 		m.mu.Lock()
 		stoppedAt := m.stoppedAt
@@ -366,8 +443,15 @@ func (c *Characteristic) StopNotify() *dbus.Error {
 	c.m.mu.Lock()
 	c.m.notify = false
 	c.m.receiver = ""
+	c.m.state.Hosts.Active = ""
+	c.m.controls = false
+	c.m.remote = false
+	c.m.token = ""
+	c.m.assembly = controlAssembler{}
 	c.m.state.Connected = false
+	c.m.disconnectedSince = time.Now()
 	c.m.state.State = "disconnected"
+	c.m.state.Control = ControlState{Mode: "ordinary"}
 	cancel := c.m.cancel
 	c.m.mu.Unlock()
 	if cancel != nil {
@@ -381,13 +465,23 @@ func (c *Characteristic) WriteValue(value []byte, options map[string]dbus.Varian
 		return dbus.NewError("org.bluez.Error.NotSupported", nil)
 	}
 	var v struct {
-		Op      string `json:"op"`
-		Packet  int    `json:"packet"`
-		Session uint16 `json:"session"`
-		Text    string `json:"text"`
-		Final   bool   `json:"final"`
-		Acks    bool   `json:"acks"`
-		Frame   uint32 `json:"frame"`
+		Negotiated   bool   `json:"negotiated"`
+		ReceiverID   string `json:"receiverID"`
+		ReceiverName string `json:"receiverName"`
+		Op           string `json:"op"`
+		Packet       int    `json:"packet"`
+		Session      uint16 `json:"session"`
+		Text         string `json:"text"`
+		Final        bool   `json:"final"`
+		Acks         bool   `json:"acks"`
+		Frame        uint32 `json:"frame"`
+		Version      int    `json:"version"`
+		Remote       bool   `json:"remote"`
+		Token        string `json:"token"`
+		ID           uint32 `json:"id"`
+		Part         int    `json:"p"`
+		Total        int    `json:"n"`
+		Data         string `json:"d"`
 	}
 	if json.Unmarshal(value, &v) != nil {
 		return dbus.NewError("org.bluez.Error.InvalidArguments", nil)
@@ -398,26 +492,67 @@ func (c *Characteristic) WriteValue(value []byte, options map[string]dbus.Varian
 	}
 	c.m.mu.Lock()
 	defer c.m.mu.Unlock()
-	if c.m.receiver != "" && c.m.receiver != device {
+	if v.Op != "hello" && (c.m.receiver == "" || c.m.receiver != device) || c.m.receiver != "" && c.m.receiver != device {
+		if v.Op == "hello" {
+			c.m.logHostHandshake("another_receiver_active")
+		}
 		return dbus.NewError("org.bluez.Error.NotPermitted", nil)
 	}
 	switch v.Op {
 	case "hello":
-		if !c.m.notify {
+		if c.m.deepReserved {
+			c.m.logHostHandshake("deep_sleep_pending")
 			return dbus.NewError("org.bluez.Error.NotReady", nil)
 		}
+		if !validReceiver(device) {
+			c.m.logHostHandshake("invalid_device_path")
+			return dbus.NewError("org.bluez.Error.NotPermitted", nil)
+		}
+		if !c.m.notify {
+			c.m.logHostHandshake("audio_subscription_not_ready")
+			return dbus.NewError("org.bluez.Error.NotReady", nil)
+		}
+		if c.m.state.Hosts.Discovering && time.Now().After(c.m.discoveryUntil) {
+			c.m.state.Hosts.Discovering = false
+		}
+		if !c.m.acceptHost(Host{ID: v.ReceiverID, Name: v.ReceiverName}) {
+			go c.m.disconnectHost(device)
+			return dbus.NewError("org.bluez.Error.NotPermitted", nil)
+		}
+		c.m.logHostHandshake("selected_receiver_accepted")
+		c.m.state.Hosts.Active = v.ReceiverID
 		c.m.receiver = device
-		if file := receiverFile(); file != "" && validReceiver(device) {
-			if err := os.WriteFile(file, []byte(device), 0600); err != nil {
+		c.m.controls = v.Version == 2 && len(v.Token) == 16
+		c.m.remote = c.m.controls && v.Remote
+		c.m.token = v.Token
+		c.m.assembly = controlAssembler{}
+		if receiverFile() != "" {
+			if err := rememberReceiver(device); err != nil {
 				log.Print("Cannot retain microphone peer for crash recovery")
 			}
 		}
 		c.m.state.Connected = true
+		c.m.disconnectedSince = time.Time{}
 		c.m.state.State = "ready"
-		c.m.state.Packet = clamp(v.Packet, 20, 244)
+		c.m.state.Control = ControlState{Mode: "ordinary"}
+		if c.m.controls {
+			c.m.state.State = "service"
+		}
+		c.m.state.Packet = notificationPacket(v.Packet, v.Negotiated, options)
 		c.m.state.Error = ""
 		c.m.acks = v.Acks
 		c.m.ackFrames = 0
+		select {
+		case c.m.telemetryKick <- struct{}{}:
+		default:
+		}
+		if v.Negotiated {
+			token, packet := c.m.token, c.m.state.Packet
+			go func() {
+				b, _ := json.Marshal(map[string]any{"op": "transport", "token": token, "packet": packet})
+				_ = c.m.send(6, 0, 0, b)
+			}()
+		}
 		go c.m.probeOnce.Do(func() {
 			if c.m.probeFile != "" || c.m.probeSecs > 0 {
 				time.Sleep(time.Second)
@@ -426,6 +561,17 @@ func (c *Characteristic) WriteValue(value []byte, options map[string]dbus.Varian
 				}
 			}
 		})
+	case "c":
+		if !c.m.controls || v.Token != c.m.token || device == "" {
+			return dbus.NewError("org.bluez.Error.NotPermitted", nil)
+		}
+		b, err := c.m.assembly.append(v.ID, v.Part, v.Total, v.Data)
+		if err != nil {
+			return dbus.NewError("org.bluez.Error.InvalidArguments", nil)
+		}
+		if b != nil && c.m.applyControl(b) != nil {
+			return dbus.NewError("org.bluez.Error.InvalidArguments", nil)
+		}
 	case "ack":
 		if v.Session == c.m.state.Session && v.Frame >= c.m.ackFrames && v.Frame <= c.m.state.Frames {
 			c.m.ackFrames = v.Frame
@@ -447,6 +593,9 @@ func (c *Characteristic) WriteValue(value []byte, options map[string]dbus.Varian
 		if v.Session == c.m.state.Session {
 			c.m.state.State = "error"
 			c.m.state.Error = v.Text
+			if c.m.cancel != nil {
+				c.m.cancel()
+			}
 		}
 	default:
 		return dbus.NewError("org.bluez.Error.NotSupported", nil)
@@ -497,48 +646,48 @@ func (m *Mic) register() error {
 		return err
 	}
 	obj := m.conn.Object("org.bluez", adapter)
-	if err := obj.Call("org.bluez.GattManager1.RegisterApplication", 0, root, map[string]dbus.Variant{}).Err; err != nil {
+	return m.registerEndpoints(func(method string, path dbus.ObjectPath) error {
+		return obj.Call(method, 0, path, map[string]dbus.Variant{}).Err
+	}, tinaLegacyKernel(), legacyAdvertising)
+}
+
+func (m *Mic) registerEndpoints(call func(string, dbus.ObjectPath) error, legacy bool, prepare func() error) error {
+	if err := call("org.bluez.GattManager1.RegisterApplication", root); err != nil {
 		return err
 	}
-	if err := obj.Call("org.bluez.LEAdvertisingManager1.RegisterAdvertisement", 0, advert, map[string]dbus.Variant{}).Err; err != nil {
-		return err
-	}
-	// Tina's Linux 4.9 + BlueZ 5.78 accepts Add Advertising but omits
-	// LE Set Advertising Data / Scan Response Data. Verified with btmon.
-	// Keep BlueZ responsible for GATT and connection lifecycle, but fill the
-	// legacy controller payload explicitly on this known affected kernel.
-	if needsLegacyAdvertising() {
-		if err := legacyAdvertising(); err != nil {
-			return fmt.Errorf("legacy BLE advertising: %w", err)
+	m.gattRegistered = true
+	// Prepare controller data while advertising is disabled. RegisterAdvertisement
+	// can make the Mac connect immediately; changing data afterwards is rejected
+	// by Tina's legacy controller once it is in the LE peripheral role.
+	if legacy {
+		m.legacyConfigured = true
+		if err := prepare(); err != nil {
+			return fmt.Errorf("prepare legacy BLE advertising: %w", err)
 		}
 	}
+	if err := call("org.bluez.LEAdvertisingManager1.RegisterAdvertisement", advert); err != nil {
+		return err
+	}
+	m.advertRegistered = true
 	return nil
 }
 
-func legacyAdvertising() error {
-	command := func(op string, data []byte) error {
-		args := []string{"cmd", "0x08", op}
-		for _, v := range data {
-			args = append(args, fmt.Sprintf("%02x", v))
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, "hcitool", args...).CombinedOutput()
-		if err != nil {
-			return errors.New("cannot configure controller")
-		}
-		// hcitool can exit successfully even when HCI returns an error.
-		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
-		fields := strings.Fields(lines[len(lines)-1])
-		if len(fields) < 4 || fields[len(fields)-1] != "00" {
-			return errors.New("controller rejected advertising command")
-		}
-		return nil
+func legacyAdvertisingCommand(op string, data []byte) error {
+	var ocf uint16
+	if _, err := fmt.Sscanf(op, "0x%x", &ocf); err != nil {
+		return err
 	}
+	return controllerCommand(0x2000|ocf, data)
+}
+
+func legacyAdvertising() error {
+	return prepareLegacyAdvertising(legacyAdvertisingCommand)
+}
+
+func prepareLegacyAdvertising(command func(string, []byte) error) error {
 	if err := command("0x000a", []byte{0}); err != nil {
 		return err
 	}
-	defer command("0x000a", []byte{1})
 	uuid, _ := hex.DecodeString(strings.ReplaceAll(serviceUUID, "-", ""))
 	for i, j := 0, len(uuid)-1; i < j; i, j = i+1, j-1 {
 		uuid[i], uuid[j] = uuid[j], uuid[i]
@@ -553,8 +702,51 @@ func legacyAdvertising() error {
 			return err
 		}
 	}
-	log.Print("Applied Tina Linux 4.9 advertising compatibility fix")
+	log.Print("Prepared Tina Linux 4.9 advertising data before enabling advertisement")
 	return nil
+}
+
+// Stop publishing before disconnecting: otherwise the Mac can reconnect to
+// the old controller payload before the next GATT registration on Linux 4.9.
+func (m *Mic) unregister() {
+	m.mu.Lock()
+	peer := m.receiver
+	m.mu.Unlock()
+	if !validReceiver(peer) {
+		if b, err := os.ReadFile(receiverFile()); err == nil && len(b) <= 128 {
+			peer = strings.TrimSpace(string(b))
+		}
+	}
+	if m.legacyConfigured {
+		if err := legacyAdvertisingCommand("0x000a", []byte{0}); err != nil {
+			log.Print("Cannot stop microphone compatibility advertisement")
+		}
+	}
+	obj := m.conn.Object("org.bluez", adapter)
+	call := func(object dbus.BusObject, method string, args ...any) error {
+		limit := 500 * time.Millisecond
+		if method == "org.bluez.Device1.Disconnect" {
+			limit = 3 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), limit)
+		defer cancel()
+		return object.CallWithContext(ctx, method, 0, args...).Err
+	}
+	if m.advertRegistered {
+		_ = call(obj, "org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", advert)
+	}
+	if m.legacyConfigured {
+		// Removing the management instance can itself reapply controller state.
+		_ = legacyAdvertisingCommand("0x000a", []byte{0})
+	}
+	if validReceiver(peer) {
+		if err := call(m.conn.Object("org.bluez", dbus.ObjectPath(peer)), "org.bluez.Device1.Disconnect"); err == nil {
+			log.Print("Released microphone receiver on exit")
+		}
+	}
+	if m.gattRegistered {
+		_ = call(obj, "org.bluez.GattManager1.UnregisterApplication", root)
+	}
 }
 func (m *Mic) ipc(path string) error {
 	if info, err := os.Lstat(path); err == nil {
@@ -584,8 +776,21 @@ func (m *Mic) ipc(path string) error {
 			go func() {
 				defer c.Close()
 				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-				line, _ := bufio.NewReader(c).ReadString('\n')
-				switch strings.TrimSpace(line) {
+				line, _ := bufio.NewReader(io.LimitReader(c, 128)).ReadString('\n')
+				command := strings.TrimSpace(line)
+				if strings.HasPrefix(command, "control:") {
+					if err := m.controlAction(command); err != nil {
+						fmt.Fprintln(c, err)
+						return
+					}
+				}
+				if strings.HasPrefix(command, "hosts:") {
+					if err := m.hostAction(command); err != nil {
+						fmt.Fprintln(c, err)
+						return
+					}
+				}
+				switch command {
 				case "ping":
 					m.mu.Lock()
 					ready := m.serviceReady
@@ -605,6 +810,31 @@ func (m *Mic) ipc(path string) error {
 					m.stop(false)
 				case "cancel":
 					m.stop(true)
+				case "sleep":
+					m.stop(true)
+					m.mu.Lock()
+					m.screenAsleep = true
+					m.mu.Unlock()
+				case "wake":
+					m.mu.Lock()
+					m.screenAsleep = false
+					m.deepReserved = false
+					m.mu.Unlock()
+					select {
+					case m.telemetryKick <- struct{}{}:
+					default:
+					}
+				case "prepare-deep-sleep":
+					if m.reserveDeepSleep() {
+						fmt.Fprintln(c, "asleep-ready")
+					} else {
+						fmt.Fprintln(c, "blocked")
+					}
+					return
+				case "abort-deep-sleep":
+					m.mu.Lock()
+					m.deepReserved = false
+					m.mu.Unlock()
 				case "quit":
 					_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
 				}
@@ -637,6 +867,11 @@ func main() {
 		log.Fatal(err)
 	}
 	defer conn.Close()
+	// Catch exit requests during registration too, so partial startup reaches
+	// normal teardown rather than leaving the controller linked to the Mac.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	defer signal.Stop(sig)
 	restoreLink := func() {}
 	if runtime := os.Getenv("BRICK_MIC_RUNTIME"); strings.HasPrefix(runtime, "/tmp/brick-mic-") {
 		var linkErr error
@@ -652,22 +887,32 @@ func main() {
 		restoreLink()
 		log.Fatal(err)
 	}
-	m := &Mic{conn: conn, state: State{State: "disconnected", Packet: 20}, probeFile: *probeFile, probeSecs: *probeSecs}
+	m := &Mic{disconnectedSince: time.Now(), conn: conn, state: State{State: "disconnected", Packet: 20}, probeFile: *probeFile, probeSecs: *probeSecs, alerts: make(chan string, 8), notifyAcks: make(chan notificationReceipt, 64), telemetryKick: make(chan struct{}, 1)}
+	if err = m.loadHosts(); err != nil {
+		log.Fatal("Receiver preferences: ", err)
+	}
 	if err = m.ipc(*socket); err != nil {
 		restoreLink()
 		log.Fatal(err)
 	}
 	defer os.Remove(*socket)
+	defer m.unregister()
 	if err = m.register(); err != nil {
+		m.unregister()
 		restoreLink()
 		log.Fatal("Bluetooth service: ", err)
 	}
 	m.mu.Lock()
 	m.serviceReady = true
+	m.state.Control.Mode = "ordinary"
 	m.mu.Unlock()
+	ctx, cancelBackground := context.WithCancel(context.Background())
+	var background sync.WaitGroup
+	background.Add(2)
+	defer func() { cancelBackground(); background.Wait() }()
+	go func() { defer background.Done(); m.telemetry(ctx) }()
+	go func() { defer background.Done(); m.notifications(ctx) }()
 	log.Print("Brick Mic BLE service ready; microphone stays off until A is pressed")
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	<-sig
 	m.stop(true)
 	m.mu.Lock()
@@ -679,5 +924,4 @@ func main() {
 		case <-time.After(2 * time.Second):
 		}
 	}
-	_ = conn.Object("org.bluez", adapter).Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, advert).Err
 }
