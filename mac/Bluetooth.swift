@@ -8,6 +8,11 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
     var onState:((String)->Void)?
     var onMessage:((UInt8,Int,Int,Data)->Void)?
     var onDisconnect:(()->Void)?
+    var onReplacementCandidates:(([(id:UUID,name:String)],Bool)->Void)?
+    private var choosingReplacement=false
+    private var replacementCandidates:[UUID:CBPeripheral]=[:]
+    private var pendingReplacement:CBPeripheral?
+    private var replacementID:UUID?
  var onReady:(()->Void)?
  private(set) var controlToken=""
  private var controlID:UInt32=0
@@ -35,8 +40,8 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
     private var useCached=true
     private func stopDiscovery() {manager?.stopScan();scanTimeout?.cancel();scanTimeout=nil;retry?.cancel();retry=nil}
     private func find() {
-        guard !stopped,manager.state == .poweredOn,peripheral==nil else{return}
-        if useCached,let value=UserDefaults.standard.string(forKey:"brickPeripheral"),let id=UUID(uuidString:value),
+        guard !stopped,!choosingReplacement,manager.state == .poweredOn,peripheral==nil else{return}
+        if useCached,let id=replacementID ?? UserDefaults.standard.string(forKey:"brickPeripheral").flatMap(UUID.init(uuidString:)),
            let known=manager.retrievePeripherals(withIdentifiers:[id]).first {
             stopDiscovery();peripheral=known;known.delegate=self
             onState?("正在等待上次的 Brick…");manager.connect(known,options:nil)
@@ -57,6 +62,44 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
         manager=CBCentralManager(delegate:self,queue:nil)
     }
     func reconnect() {stopped=false;useCached=false;if let p=peripheral {manager.cancelPeripheralConnection(p)} else {find()}}
+    // Browsing never forgets the old device or transfers its editing permission.
+    // Only a successful hello from the explicitly selected device saves the pair.
+    func beginReplacementSearch()->Bool {
+        guard !diagnostic,manager?.state == .poweredOn else{return false}
+        stopped=false;stopDiscovery();choosingReplacement=true;replacementCandidates.removeAll()
+        onReplacementCandidates?([],true)
+        manager.scanForPeripherals(withServices:[Self.service],options:[CBCentralManagerScanOptionAllowDuplicatesKey:false])
+        let timeout=DispatchWorkItem{[weak self] in
+            guard let self=self,self.choosingReplacement else{return}
+            self.manager.stopScan();self.scanTimeout=nil;self.publishReplacementCandidates(searching:false)
+        }
+        scanTimeout=timeout;DispatchQueue.main.asyncAfter(deadline:.now()+12,execute:timeout)
+        return true
+    }
+    private func publishReplacementCandidates(searching:Bool){
+        let candidates=replacementCandidates.values.map { p -> (id:UUID,name:String) in
+            let name=String((p.name ?? "Brick").unicodeScalars.filter{!CharacterSet.controlCharacters.contains($0)}.prefix(32))
+            return (p.identifier,name.isEmpty ? "Brick":name)
+        }.sorted{$0.id.uuidString<$1.id.uuidString}
+        onReplacementCandidates?(candidates,searching)
+    }
+    private func finishReplacementSearch(){
+        stopDiscovery();choosingReplacement=false;replacementCandidates.removeAll();onReplacementCandidates=nil
+    }
+    func cancelReplacementSearch(){finishReplacementSearch();if peripheral==nil{find()}}
+    func selectReplacement(_ id:UUID)->Bool {
+        guard choosingReplacement,let chosen=replacementCandidates[id] else{return false}
+        finishReplacementSearch()
+        if ready,peripheral?.identifier==id{return true}
+        replacementID=id;pendingReplacement=chosen;useCached=false
+        if let previous=peripheral{manager.cancelPeripheralConnection(previous)}else{connectPendingReplacement()}
+        return true
+    }
+    private func connectPendingReplacement(){
+        guard !stopped,manager.state == .poweredOn,let chosen=pendingReplacement else{return}
+        pendingReplacement=nil;peripheral=chosen;chosen.delegate=self
+        onState?("正在连接 Brick…");manager.connect(chosen,options:nil)
+    }
     private func scan() {
         guard !stopped,manager.state == .poweredOn,peripheral==nil else{return}
         stopDiscovery();onState?("正在寻找 Brick…")
@@ -75,27 +118,33 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
     func centralManager(_ central:CBCentralManager,didDiscover peripheral:CBPeripheral,advertisementData:[String:Any],rssi RSSI:NSNumber) {
         if CommandLine.arguments.contains("--scan-all") {print("discovered name=\(peripheral.name ?? "unnamed") services=\(advertisementData[CBAdvertisementDataServiceUUIDsKey] ?? []) rssi=\(RSSI)");fflush(stdout)}
         guard (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []).contains(Self.service) else{return}
+        if choosingReplacement{replacementCandidates[peripheral.identifier]=peripheral;publishReplacementCandidates(searching:true);return}
         // Keep an established pair isolated even when cached connection fails.
-        if !diagnostic,let expected=UserDefaults.standard.string(forKey:"brickPeripheral"),peripheral.identifier.uuidString != expected{return}
+        if !diagnostic,let expected=replacementID ?? UserDefaults.standard.string(forKey:"brickPeripheral").flatMap(UUID.init(uuidString:)),peripheral.identifier != expected{return}
         guard self.peripheral==nil else{return};self.peripheral=peripheral;peripheral.delegate=self;stopDiscovery();onState?("正在连接 Brick…");central.connect(peripheral,options:nil)
     }
-    func centralManager(_ central:CBCentralManager,didConnect peripheral:CBPeripheral) {peripheral.discoverServices([Self.service])}
-    func centralManager(_ central:CBCentralManager,didFailToConnect peripheral:CBPeripheral,error:Error?) {useCached=false;disconnected()}
-    func centralManager(_ central:CBCentralManager,didDisconnectPeripheral peripheral:CBPeripheral,error:Error?) {disconnected()}
+    func centralManager(_ central:CBCentralManager,didConnect peripheral:CBPeripheral) {guard self.peripheral?.identifier==peripheral.identifier else{return};peripheral.discoverServices([Self.service])}
+    func centralManager(_ central:CBCentralManager,didFailToConnect peripheral:CBPeripheral,error:Error?) {guard self.peripheral?.identifier==peripheral.identifier else{return};useCached=false;disconnected()}
+    func centralManager(_ central:CBCentralManager,didDisconnectPeripheral peripheral:CBPeripheral,error:Error?) {guard self.peripheral?.identifier==peripheral.identifier else{return};disconnected()}
     private func disconnected() {
-        stopDiscovery();peripheral=nil;tx=nil;rx=nil;ready=false;controlsAllowed=false;controlToken="";writes.removeAll();writing=false;assembler.reset();onDisconnect?()
+        if !choosingReplacement{stopDiscovery()};peripheral=nil;tx=nil;rx=nil;ready=false;controlsAllowed=false;controlToken="";writes.removeAll();writing=false;assembler.reset();onDisconnect?()
+        if pendingReplacement != nil{connectPendingReplacement();return}
+        if choosingReplacement{return}
         if !stopped {let again=DispatchWorkItem{[weak self] in self?.find()};retry=again;DispatchQueue.main.asyncAfter(deadline:.now()+(rejected ? 3:1),execute:again)}
     }
     func peripheral(_ peripheral:CBPeripheral,didDiscoverServices error:Error?) {
+        guard self.peripheral?.identifier==peripheral.identifier else{return}
         guard error==nil else{onState?("读取蓝牙服务失败");manager.cancelPeripheralConnection(peripheral);return}
         for service in peripheral.services ?? [] where service.uuid==Self.service {peripheral.discoverCharacteristics([Self.audio,Self.control],for:service)}
     }
     func peripheral(_ peripheral:CBPeripheral,didDiscoverCharacteristicsFor service:CBService,error:Error?) {
+        guard self.peripheral?.identifier==peripheral.identifier else{return}
         guard error==nil else{onState?("读取音频通道失败");manager.cancelPeripheralConnection(peripheral);return}
         for characteristic in service.characteristics ?? [] {if characteristic.uuid==Self.audio {rx=characteristic};if characteristic.uuid==Self.control {tx=characteristic}}
         if let rx=rx,tx != nil {peripheral.setNotifyValue(true,for:rx)}
     }
     func peripheral(_ peripheral:CBPeripheral,didUpdateNotificationStateFor characteristic:CBCharacteristic,error:Error?) {
+        guard self.peripheral?.identifier==peripheral.identifier else{return}
         guard error==nil,characteristic.isNotifying else{onState?("无法订阅音频通道");manager.cancelPeripheralConnection(peripheral);return}
         // Without-response write size is the ATT payload capacity, unlike long writes.
         let packet=min(244,peripheral.maximumWriteValueLength(for:.withoutResponse))
@@ -105,12 +154,14 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
         write(["receiverID":receiverID,"receiverName":receiverName,"op":"hello","packet":packet,"acks":true,"version":diagnostic ? 1:2,"remote":controlsAllowed,"token":controlToken]);print("BLE notification payload=\(packet)")
     }
     func peripheral(_ peripheral:CBPeripheral,didWriteValueFor characteristic:CBCharacteristic,error:Error?) {
+        guard self.peripheral?.identifier==peripheral.identifier else{return}
         writing=false
         if error != nil {rejected = !ready;onState?(ready ? "蓝牙控制消息发送失败":"Brick 尚未选择这台电脑");manager.cancelPeripheralConnection(peripheral);return}
-        if !ready {ready=true;useCached=true;UserDefaults.standard.set(peripheral.identifier.uuidString,forKey:"brickPeripheral");stopDiscovery();onState?("已连接 · 在 Brick 上按住 A 说话");onReady?()}
+        if !ready {ready=true;useCached=true;replacementID=nil;UserDefaults.standard.set(peripheral.identifier.uuidString,forKey:"brickPeripheral");if !choosingReplacement{stopDiscovery()};onState?("已连接 · 在 Brick 上按住 A 说话");onReady?()}
         pump()
     }
     func peripheral(_ peripheral:CBPeripheral,didUpdateValueFor characteristic:CBCharacteristic,error:Error?) {
+        guard self.peripheral?.identifier==peripheral.identifier else{return}
         guard error==nil,let value=characteristic.value else{return}
         do {if let m=try assembler.append(value) {onMessage?(m.kind,m.session,m.frame,m.data)}} catch {onState?("音频分片丢失，本次输入已取消");onDisconnect?()}
     }
@@ -135,5 +186,5 @@ final class BrickBluetooth:NSObject,CBCentralManagerDelegate,CBPeripheralDelegat
             write(["op":"c","token":controlToken,"id":controlID,"p":part,"n":total,"d":bytes.base64EncodedString()])
         }
     }
-    func stop() {stopped=true;stopDiscovery();if let p=peripheral {manager.cancelPeripheralConnection(p)}}
+    func stop() {stopped=true;finishReplacementSearch();pendingReplacement=nil;if let p=peripheral {manager.cancelPeripheralConnection(p)}}
 }

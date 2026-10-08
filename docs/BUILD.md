@@ -95,7 +95,7 @@ Linux 或 Intel Mac 请使用 `scripts/prepare.sh` 下载的对应 Bun 路径。
 ./scripts/package-release.sh
 ```
 
-`releases/v0.4.16/` 包含 Mac ZIP、Brick ZIP、Linux 源码安装包、SHA256SUMS.txt 和构建说明。ZIP 保留应用文件夹名称与执行权限；Mac 包包含 arm64 接收端，Brick 包包含完整 PocketJS 字库与依赖许可证。
+`releases/v<VERSION>/` 包含 Mac ZIP、Brick ZIP、Linux 源码安装包、SHA256SUMS.txt 和构建说明。ZIP 保留应用文件夹名称与执行权限；Mac 包包含 arm64 接收端，Brick 包包含完整 PocketJS 字库与依赖许可证。
 
 发布二进制前，请保留同版本源代码、固定依赖记录和第三方许可证；Release 不应包含 API Key、录音、个人配置、诊断输出或设备数据目录。
 

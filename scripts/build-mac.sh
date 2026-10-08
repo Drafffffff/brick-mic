@@ -41,7 +41,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleName</key><string>Brick Mic</string>
 <key>CFBundleIconFile</key><string>BrickMic</string>
 <key>CFBundleExecutable</key><string>BrickMic</string>
-<key>CFBundleVersion</key><string>20</string>
+<key>CFBundleVersion</key><string>21</string>
 <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
 <key>LSMinimumSystemVersion</key><string>13.0</string>
 <key>LSUIElement</key><true/>

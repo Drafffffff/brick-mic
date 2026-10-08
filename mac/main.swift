@@ -61,6 +61,7 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
     var statusItem:NSStatusItem!
     var window:NSWindow!
     var settingsWindow:NSWindow!
+    var replacementPicker:NSAlert?
     var permissionGuide:InputPermissionGuide?
     let status=NSTextField(labelWithString:"正在启动…")
     let detail=NSTextField(labelWithString:"按住掌机 A 键说话，松开结束")
@@ -180,6 +181,40 @@ final class AppDelegate:NSObject,NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline:.now()+1.5){[weak self] in self?.copyButton.title="复制文字"}
     }
     @objc func reconnect(){connected=false;abort("重新连接中…");if preview==nil {ble.reconnect()} else {setStatus("等待掌机连接")}}
+    @objc func replaceBrick(){
+        guard preview==nil,replacementPicker==nil else{return}
+        guard currentSession==0,!inserting else{setStatus("请先结束本次输入，再更换掌机");return}
+        show()
+        let alert=NSAlert();alert.messageText="更换掌机"
+        alert.informativeText="在新 Brick 打开 Brick Mic，按 L1+R1 → 查找电脑。选择下方设备连接，再在掌机选择这台 Mac。"
+        alert.addButton(withTitle:"连接所选掌机");alert.addButton(withTitle:"取消")
+        let picker=NSPopUpButton(frame:NSRect(x:0,y:28,width:340,height:26),pullsDown:false)
+        picker.setAccessibilityLabel("附近的 Brick")
+        let hint=NSTextField(labelWithString:"正在寻找附近的 Brick…");hint.frame=NSRect(x:0,y:0,width:340,height:22);hint.font = .systemFont(ofSize:12);hint.textColor = .secondaryLabelColor
+        let accessory=NSView(frame:NSRect(x:0,y:0,width:340,height:60));accessory.addSubview(picker);accessory.addSubview(hint);alert.accessoryView=accessory
+        alert.buttons[0].isEnabled=false
+        ble.onReplacementCandidates={ candidates,searching in
+            let selected=picker.selectedItem?.representedObject as? UUID
+            picker.removeAllItems()
+            for candidate in candidates{
+                picker.addItem(withTitle:candidate.name+" · "+candidate.id.uuidString.suffix(6))
+                picker.lastItem?.representedObject=candidate.id
+            }
+            if let selected=selected,let item=picker.itemArray.first(where:{$0.representedObject as? UUID==selected}){picker.select(item)}
+            picker.isEnabled = !candidates.isEmpty;alert.buttons[0].isEnabled = !candidates.isEmpty
+            hint.stringValue=searching ? "正在寻找附近的 Brick…":candidates.isEmpty ? "未找到掌机，请确认新 Brick 已打开查找电脑":"请选择要连接的掌机"
+        }
+        guard ble.beginReplacementSearch() else{
+            ble.onReplacementCandidates=nil;setStatus("请先开启 Mac 蓝牙，再更换掌机");return
+        }
+        replacementPicker=alert
+        alert.beginSheetModal(for:window){[weak self] response in
+            guard let self=self else{return};self.replacementPicker=nil
+            guard self.currentSession==0,!self.inserting else{self.ble.cancelReplacementSearch();self.setStatus("请先结束本次输入，再更换掌机");return}
+            if response == .alertFirstButtonReturn,let id=picker.selectedItem?.representedObject as? UUID,self.ble.selectReplacement(id){return}
+            self.ble.cancelReplacementSearch()
+        }
+    }
     @objc func save(){
         guard let url=URL(string:endpoint.stringValue),url.scheme=="wss",url.host?.isEmpty==false,model.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)==ASRConfiguration.model,url.path=="/api-ws/v1/inference" else{saveFeedback.textColor = .systemRed;saveFeedback.stringValue="请检查模型和 wss:// 服务地址";return}
         // Preview never reads or writes real credentials or preferences.

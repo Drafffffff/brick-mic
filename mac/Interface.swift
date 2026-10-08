@@ -39,7 +39,7 @@ extension AppDelegate {
         statusItem.button?.font=NSFont.monospacedDigitSystemFont(ofSize:12,weight:.medium);statusItem.button?.imagePosition = .imageLeading;updateStatusBar();statusItem.button?.target=self;statusItem.button?.action=#selector(statusClicked)
         statusItem.button?.sendAction(on:[.leftMouseUp,.rightMouseUp]);statusItem.button?.setAccessibilityLabel("Brick Mic")
         let menu=NSMenu()
-        for (title,selector,shortcut) in [("打开 Brick Mic",#selector(show),""),("设置…",#selector(showSettings),","),("重新连接掌机",#selector(reconnect),"")] {
+        for (title,selector,shortcut) in [("打开 Brick Mic",#selector(show),""),("设置…",#selector(showSettings),","),("重新连接掌机",#selector(reconnect),""),("更换掌机…",#selector(replaceBrick),"")] {
             let item=NSMenuItem(title:title,action:selector,keyEquivalent:shortcut);item.target=self;menu.addItem(item)
         }
         menu.addItem(.separator());let quitItem=NSMenuItem(title:"退出 Brick Mic",action:#selector(quit),keyEquivalent:"q");quitItem.target=self;menu.addItem(quitItem)
@@ -114,7 +114,7 @@ extension AppDelegate {
         settingsPermissionButton=button("设置输入权限…",#selector(permissions))
         inputTestButton=button("测试输入",#selector(testInput));inputTestButton.toolTip="3 秒后输入测试文字，请先点击目标文本框"
         remoteControl.target=self;remoteControl.action=#selector(toggleRemote);remoteControl.isEnabled=false;remoteControl.font = .systemFont(ofSize:12)
-        let input=column([permissionTitle,permissionState,row([settingsPermissionButton,inputTestButton]),remoteControl],spacing:8)
+        let input=column([permissionTitle,permissionState,row([settingsPermissionButton,inputTestButton]),remoteControl,button("更换掌机…",#selector(replaceBrick))],spacing:8)
         advancedButton=NSButton(title:"高级设置",target:self,action:#selector(toggleAdvanced));advancedButton.isBordered=false;advancedButton.image=NSImage(systemSymbolName:"chevron.right",accessibilityDescription:nil);advancedButton.imagePosition = .imageLeading;advancedButton.setButtonType(.pushOnPushOff)
         advancedButton.setAccessibilityLabel("展开高级设置")
         model.placeholderString=ASRConfiguration.model;endpoint.placeholderString="wss:// 服务域名/api-ws/v1/inference"
